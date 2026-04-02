@@ -16,6 +16,8 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { checkBudget, isRestrictedMode, sendTelegramAlert } from './spend-tracker.js';
+import { COST_PROXY_PORT } from './cost-proxy.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -248,6 +250,17 @@ async function buildContainerArgs(
     );
   }
 
+  // APEX Cost Enforcement: Override ANTHROPIC_BASE_URL to route through cost proxy.
+  // The cost proxy (port 10255) forwards to OneCLI (port 10254) after enforcing
+  // budget, model allowlist, and token caps on every API call.
+  // Remove any existing ANTHROPIC_BASE_URL set by OneCLI, then add our override.
+  const baseUrlIdx = args.findIndex((a) => a.startsWith('ANTHROPIC_BASE_URL='));
+  if (baseUrlIdx !== -1) {
+    // The -e flag is at baseUrlIdx - 1
+    args.splice(baseUrlIdx - 1, 2);
+  }
+  args.push('-e', `ANTHROPIC_BASE_URL=http://host.docker.internal:${COST_PROXY_PORT}`);
+
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
@@ -280,6 +293,26 @@ export async function runContainerAgent(
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
+  // APEX Cost Enforcement: pre-spawn budget gate
+  const budget = checkBudget();
+  if (!budget.allowed) {
+    const msg = `APEX HARD STOP: Daily limit reached ($${budget.daily_spend.toFixed(2)}/$3.00). Container spawn blocked for group: ${group.name}`;
+    logger.error(msg);
+    sendTelegramAlert(msg).catch(() => {});
+    return {
+      status: 'error',
+      result: null,
+      error: 'APEX_BUDGET_EXCEEDED: Daily spend limit reached. No API calls allowed today.',
+    };
+  }
+
+  if (isRestrictedMode()) {
+    logger.warn(
+      { group: group.name, spend: budget.daily_spend },
+      'APEX: Running in restricted mode (spend >= $2.50)',
+    );
+  }
+
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);

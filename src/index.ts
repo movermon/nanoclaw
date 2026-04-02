@@ -63,6 +63,14 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import {
+  checkBudget,
+  getSpendSummary,
+  isRestrictedMode,
+  loadTracker,
+  sendTelegramAlert,
+} from './spend-tracker.js';
+import { startCostProxy } from './cost-proxy.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -546,7 +554,58 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+/**
+ * Schedule daily spend report at 23:59 UTC.
+ */
+function scheduleDailyReport(): void {
+  const scheduleNext = () => {
+    const now = new Date();
+    const target = new Date(now);
+    target.setUTCHours(23, 59, 0, 0);
+    if (target.getTime() <= now.getTime()) {
+      target.setUTCDate(target.getUTCDate() + 1);
+    }
+    const delay = target.getTime() - now.getTime();
+
+    setTimeout(async () => {
+      try {
+        const summary = getSpendSummary();
+        await sendTelegramAlert(summary);
+        logger.info('APEX: Daily spend report sent');
+      } catch (err) {
+        logger.error({ err }, 'APEX: Failed to send daily spend report');
+      }
+      scheduleNext();
+    }, delay);
+
+    logger.info(
+      { nextReport: target.toISOString(), delayMs: delay },
+      'APEX: Daily report scheduled',
+    );
+  };
+  scheduleNext();
+}
+
 async function main(): Promise<void> {
+  // APEX Cost Enforcement: Start cost proxy before anything else
+  try {
+    await startCostProxy();
+    logger.info('APEX: Cost enforcement proxy running');
+  } catch (err) {
+    logger.error({ err }, 'APEX: Failed to start cost proxy — aborting');
+    process.exit(1);
+  }
+
+  // APEX Restart Guard: If spend >= $2.50 on restart, enter restricted mode
+  const tracker = loadTracker();
+  if (tracker.daily_spend_usd >= 2.5) {
+    const msg = `⚠️ APEX RESTART GUARD: Booting in restricted mode. Daily spend: $${tracker.daily_spend_usd.toFixed(2)}/$3.00. No autonomous API calls until Micah confirms.`;
+    logger.warn(msg);
+    await sendTelegramAlert(msg);
+    // In restricted mode, we still start channels and message loop but
+    // the budget gate in container-runner.ts will block spawns if >= $3.00
+  }
+
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
@@ -666,7 +725,12 @@ async function main(): Promise<void> {
       continue;
     }
     channels.push(channel);
-    await channel.connect();
+    try {
+      await channel.connect();
+    } catch (err) {
+      logger.error({ channel: channelName, err }, 'Channel failed to connect');
+      channels.pop();
+    }
   }
   if (channels.length === 0) {
     logger.fatal('No channels connected');
@@ -725,6 +789,9 @@ async function main(): Promise<void> {
       }
     },
   });
+  // APEX: Schedule daily spend report at 23:59 UTC
+  scheduleDailyReport();
+
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
   startMessageLoop().catch((err) => {

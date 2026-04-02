@@ -11,17 +11,29 @@ import {
   normalizeMessageContent,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
-import type { GroupMetadata, WAMessageKey, WASocket, proto as ProtoTypes } from '@whiskeysockets/baileys';
+import type {
+  GroupMetadata,
+  WAMessageKey,
+  WASocket,
+  proto as ProtoTypes,
+} from '@whiskeysockets/baileys';
 // proto is not statically analyzable as a named ESM export from this CJS module
 import { createRequire } from 'module';
-const { proto } = createRequire(import.meta.url)('@whiskeysockets/baileys') as { proto: typeof ProtoTypes };
+const { proto } = createRequire(import.meta.url)('@whiskeysockets/baileys') as {
+  proto: typeof ProtoTypes;
+};
 
 import {
   ASSISTANT_HAS_OWN_NUMBER,
   ASSISTANT_NAME,
   STORE_DIR,
 } from '../config.js';
-import { getLastGroupSync, getMessageContentById, setLastGroupSync, updateChatName } from '../db.js';
+import {
+  getLastGroupSync,
+  getMessageContentById,
+  setLastGroupSync,
+  updateChatName,
+} from '../db.js';
 import { logger } from '../logger.js';
 import pino from 'pino';
 
@@ -52,6 +64,7 @@ export class WhatsAppChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
+  private authFailed = false;
   /** Cache of recently sent messages for retry requests (max 256 entries). */
   private sentMessageCache = new Map<string, ProtoTypes.IMessage>();
   /** Short-lived cache of phone-normalized group metadata for outbound sends. */
@@ -61,8 +74,9 @@ export class WhatsAppChannel implements Channel {
   >();
   /** Bot's LID user ID (e.g. "80355281346633") for normalizing group mentions. */
   private botLidUser?: string;
-  /** Resolve the initial connect() once the first successful open happens. */
+  /** Resolve/reject the initial connect() once the first successful open happens (or auth fails). */
   private pendingFirstOpen?: () => void;
+  private pendingFirstOpenReject?: (err: Error) => void;
 
   private opts: WhatsAppChannelOpts;
 
@@ -73,6 +87,7 @@ export class WhatsAppChannel implements Channel {
   async connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.pendingFirstOpen = resolve;
+      this.pendingFirstOpenReject = reject;
       this.connectInternal().catch(reject);
     });
   }
@@ -104,16 +119,23 @@ export class WhatsAppChannel implements Channel {
       getMessage: async (key: WAMessageKey) => {
         const cached = this.sentMessageCache.get(key.id || '');
         if (cached) {
-          logger.debug({ id: key.id }, 'getMessage: returning cached message for retry');
+          logger.debug(
+            { id: key.id },
+            'getMessage: returning cached message for retry',
+          );
           return cached;
         }
         // Fall back to DB lookup so WhatsApp can re-encrypt on retry.
         // Without this, self-chat messages show "waiting for this message".
-        const content = key.id && key.remoteJid
-          ? getMessageContentById(key.id, key.remoteJid)
-          : undefined;
+        const content =
+          key.id && key.remoteJid
+            ? getMessageContentById(key.id, key.remoteJid)
+            : undefined;
         if (content) {
-          logger.debug({ id: key.id }, 'getMessage: returning DB message for retry');
+          logger.debug(
+            { id: key.id },
+            'getMessage: returning DB message for retry',
+          );
           return proto.Message.fromObject({ conversation: content });
         }
         // Return empty message rather than undefined — prevents indefinite
@@ -132,7 +154,10 @@ export class WhatsAppChannel implements Channel {
         exec(
           `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
         );
-        setTimeout(() => process.exit(1), 1000);
+        // Don't exit the process — other channels may be running.
+        // Mark auth as failed so reconnect loop stops, then disconnect.
+        this.authFailed = true;
+        setTimeout(() => this.disconnect(), 1000);
       }
 
       if (connection === 'close') {
@@ -140,7 +165,7 @@ export class WhatsAppChannel implements Channel {
         const reason = (
           lastDisconnect?.error as { output?: { statusCode?: number } }
         )?.output?.statusCode;
-        const shouldReconnect = reason !== DisconnectReason.loggedOut;
+        const shouldReconnect = reason !== DisconnectReason.loggedOut && !this.authFailed;
         logger.info(
           {
             reason,
@@ -162,7 +187,7 @@ export class WhatsAppChannel implements Channel {
           });
         } else {
           logger.info('Logged out. Run /setup to re-authenticate.');
-          process.exit(0);
+          this.disconnect();
         }
       } else if (connection === 'open') {
         this.connected = true;
@@ -244,7 +269,10 @@ export class WhatsAppChannel implements Channel {
               phoneJid,
             );
             chatJid = phoneJid;
-            logger.info({ lidJid: rawJid, phoneJid }, 'Translated LID via senderPn');
+            logger.info(
+              { lidJid: rawJid, phoneJid },
+              'Translated LID via senderPn',
+            );
           }
 
           const timestamp = new Date(
@@ -274,7 +302,10 @@ export class WhatsAppChannel implements Channel {
             // WhatsApp group mentions use the LID in raw text (e.g. "@80355281346633")
             // instead of the display name. Normalize to @AssistantName for trigger matching.
             if (this.botLidUser && content.includes(`@${this.botLidUser}`)) {
-              content = content.replace(`@${this.botLidUser}`, `@${ASSISTANT_NAME}`);
+              content = content.replace(
+                `@${this.botLidUser}`,
+                `@${ASSISTANT_NAME}`,
+              );
             }
 
             // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
@@ -305,7 +336,11 @@ export class WhatsAppChannel implements Channel {
           } else if (chatJid !== rawJid) {
             // LID translation produced a JID that doesn't match any registered group
             logger.warn(
-              { rawJid, translatedJid: chatJid, registeredJids: Object.keys(groups) },
+              {
+                rawJid,
+                translatedJid: chatJid,
+                registeredJids: Object.keys(groups),
+              },
               'Message JID not found in registered groups after translation',
             );
           }
@@ -367,6 +402,13 @@ export class WhatsAppChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
+    // Reject the pending connect() promise so startup isn't blocked
+    // when auth fails before the first successful open.
+    if (this.pendingFirstOpenReject) {
+      this.pendingFirstOpenReject(new Error('WhatsApp auth failed'));
+      this.pendingFirstOpen = undefined;
+      this.pendingFirstOpenReject = undefined;
+    }
     this.sock?.end(undefined);
   }
 
@@ -436,7 +478,9 @@ export class WhatsAppChannel implements Channel {
 
     // Query Baileys' signal repository for the mapping
     try {
-      const pn = await (this.sock.signalRepository as any)?.lidMapping?.getPNForLID(jid);
+      const pn = await (
+        this.sock.signalRepository as any
+      )?.lidMapping?.getPNForLID(jid);
       if (pn) {
         const phoneJid = `${pn.split('@')[0].split(':')[0]}@s.whatsapp.net`;
         this.setLidPhoneMapping(lidUser, phoneJid);
@@ -480,7 +524,8 @@ export class WhatsAppChannel implements Channel {
     );
     const normalized = { ...metadata, participants };
     const mappedCount = participants.filter(
-      (participant, index) => participant.id !== metadata.participants[index]?.id,
+      (participant, index) =>
+        participant.id !== metadata.participants[index]?.id,
     ).length;
 
     logger.info(
