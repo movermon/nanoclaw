@@ -1,4 +1,5 @@
 import https from 'https';
+import { createRequire } from 'module';
 import { Api, Bot } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
@@ -11,6 +12,11 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+// APEX Budget Brain: /budget command
+const _require = createRequire(import.meta.url);
+const budgetBrainPath = _require.resolve('../../budget-brain.js');
+const { formatBudgetMessage } = await import(budgetBrainPath);
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -80,9 +86,27 @@ export class TelegramChannel implements Channel {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
     });
 
+    // APEX Budget Dashboard command
+    this.bot.command('budget', async (ctx) => {
+      try {
+        const message = formatBudgetMessage();
+        await sendTelegramMessage(
+          this.bot!.api,
+          ctx.chat.id,
+          message,
+          ctx.message?.message_thread_id
+            ? { message_thread_id: ctx.message.message_thread_id }
+            : {},
+        );
+      } catch (err) {
+        logger.error({ err }, 'Failed to generate budget dashboard');
+        ctx.reply('Failed to generate budget dashboard.');
+      }
+    });
+
     // Telegram bot commands handled above — skip them in the general handler
     // so they don't also get stored as messages. All other /commands flow through.
-    const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping']);
+    const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping', 'budget']);
 
     this.bot.on('message:text', async (ctx) => {
       if (ctx.message.text.startsWith('/')) {

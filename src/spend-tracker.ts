@@ -175,7 +175,10 @@ export function checkBudget(): BudgetCheck {
 
 export function isRestrictedMode(): boolean {
   const tracker = loadTracker();
-  return tracker.status === 'restricted' || tracker.daily_spend_usd >= RESTRICTED_MODE_USD;
+  return (
+    tracker.status === 'restricted' ||
+    tracker.daily_spend_usd >= RESTRICTED_MODE_USD
+  );
 }
 
 export function getSpendSummary(): string {
@@ -210,7 +213,9 @@ const TELEGRAM_CHAT_ID = '8111645127';
 export async function sendTelegramAlert(message: string): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
-    logger.warn('APEX: Cannot send Telegram alert — TELEGRAM_BOT_TOKEN not set');
+    logger.warn(
+      'APEX: Cannot send Telegram alert — TELEGRAM_BOT_TOKEN not set',
+    );
     return;
   }
 

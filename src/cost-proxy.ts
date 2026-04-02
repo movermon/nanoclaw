@@ -11,13 +11,19 @@
  * - Spend tracking and Telegram alerts
  */
 import http from 'http';
+import { createRequire } from 'module';
 
 import { logger } from './logger.js';
-import {
-  checkBudget,
-  recordCall,
-  sendTelegramAlert,
-} from './spend-tracker.js';
+import { checkBudget, recordCall, sendTelegramAlert } from './spend-tracker.js';
+
+// Budget Brain: pacing enforcement
+const require = createRequire(import.meta.url);
+const budgetBrainPath = require.resolve('../budget-brain.js');
+const { getPacingAllowance, requiresSonnet } = await import(budgetBrainPath);
+
+// Prompt Compressor: automatic prompt size reduction
+const compressorPath = require.resolve('../prompt-compressor.js');
+const { compressMessages } = await import(compressorPath);
 
 export const COST_PROXY_PORT = 10255;
 
@@ -36,7 +42,9 @@ const UPSTREAM_PORT = 10254;
 
 let alertCooldown = 0; // Prevent Telegram alert spam
 
-function enforceRequestBody(body: Buffer): { enforced: string; model: string; maxTokens: number } | null {
+function enforceRequestBody(
+  body: Buffer,
+): { enforced: string; model: string; maxTokens: number } | null {
   try {
     const parsed = JSON.parse(body.toString());
 
@@ -54,7 +62,11 @@ function enforceRequestBody(body: Buffer): { enforced: string; model: string; ma
     if (!parsed.max_tokens) {
       parsed.max_tokens = DEFAULT_MAX_TOKENS;
     }
-    parsed.max_tokens = Math.min(parsed.max_tokens, modelCap, ABSOLUTE_MAX_TOKENS);
+    parsed.max_tokens = Math.min(
+      parsed.max_tokens,
+      modelCap,
+      ABSOLUTE_MAX_TOKENS,
+    );
 
     const enforced = JSON.stringify(parsed);
     return { enforced, model: parsed.model, maxTokens: parsed.max_tokens };
@@ -90,13 +102,15 @@ export function startCostProxy(): Promise<http.Server> {
             }
 
             res.writeHead(429, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              type: 'error',
-              error: {
-                type: 'rate_limit_error',
-                message: `APEX_BUDGET_EXCEEDED: ${msg}`,
-              },
-            }));
+            res.end(
+              JSON.stringify({
+                type: 'error',
+                error: {
+                  type: 'rate_limit_error',
+                  message: `APEX_BUDGET_EXCEEDED: ${msg}`,
+                },
+              }),
+            );
             return;
           }
 
@@ -109,6 +123,24 @@ export function startCostProxy(): Promise<http.Server> {
               ).catch(() => {});
             }
           }
+
+          // APEX Pacing: check if current time block has allowance
+          const pacing = getPacingAllowance();
+          if (pacing.exhausted) {
+            const msg = `APEX PACING: ${pacing.block_label} block (${pacing.block_hours}) exhausted. Task queued for next block.`;
+            logger.warn(msg);
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                type: 'error',
+                error: {
+                  type: 'rate_limit_error',
+                  message: `APEX_PACING_EXHAUSTED: ${msg}`,
+                },
+              }),
+            );
+            return;
+          }
         }
 
         // Enforce model and token caps on messages requests
@@ -119,6 +151,52 @@ export function startCostProxy(): Promise<http.Server> {
           if (enforced) {
             forwardBody = enforced.enforced;
             trackedModel = enforced.model;
+
+            // APEX Sonnet Firewall: block Sonnet unless justified
+            if (trackedModel === 'claude-sonnet-4-6') {
+              const sonnetCheck = requiresSonnet('complex_reasoning', {});
+              if (!sonnetCheck.allowed) {
+                logger.info(
+                  { reason: sonnetCheck.reason },
+                  'APEX: Sonnet blocked by firewall, downgrading to Haiku',
+                );
+                const parsed = JSON.parse(forwardBody);
+                parsed.model = DEFAULT_MODEL;
+                const modelCap =
+                  TOKEN_CAPS[DEFAULT_MODEL] || ABSOLUTE_MAX_TOKENS;
+                parsed.max_tokens = Math.min(
+                  parsed.max_tokens,
+                  modelCap,
+                  ABSOLUTE_MAX_TOKENS,
+                );
+                forwardBody = JSON.stringify(parsed);
+                trackedModel = DEFAULT_MODEL;
+              }
+            }
+
+            // APEX Prompt Compressor: reduce prompt size before sending
+            try {
+              const parsed = JSON.parse(forwardBody);
+              if (parsed.messages && Array.isArray(parsed.messages)) {
+                const { messages: compressed, stats } = compressMessages(
+                  parsed.messages,
+                );
+                if (stats.totalReduction > 0) {
+                  parsed.messages = compressed;
+                  forwardBody = JSON.stringify(parsed);
+                  logger.debug(
+                    {
+                      reduction: `${stats.totalReduction}%`,
+                      original: stats.totalOriginal,
+                      compressed: stats.totalCompressed,
+                    },
+                    'APEX: Prompt compressed',
+                  );
+                }
+              }
+            } catch {
+              // Non-parseable body, skip compression
+            }
           }
         }
 
@@ -182,13 +260,15 @@ export function startCostProxy(): Promise<http.Server> {
         proxyReq.on('error', (err) => {
           logger.error({ err, url: req.url }, 'APEX: Upstream proxy error');
           res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: {
-              type: 'api_error',
-              message: `APEX proxy upstream error: ${err.message}`,
-            },
-          }));
+          res.end(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'api_error',
+                message: `APEX proxy upstream error: ${err.message}`,
+              },
+            }),
+          );
         });
 
         proxyReq.write(forwardBody);

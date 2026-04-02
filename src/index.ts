@@ -71,6 +71,14 @@ import {
   sendTelegramAlert,
 } from './spend-tracker.js';
 import { startCostProxy } from './cost-proxy.js';
+import { createRequire } from 'module';
+
+// APEX Budget Brain & Morning Routine (JS modules)
+const _require = createRequire(import.meta.url);
+const budgetBrainPath = _require.resolve('../budget-brain.js');
+const morningRoutinePath = _require.resolve('../morning-routine.js');
+const { getDailyEnvelope, getPacingAllowance } = await import(budgetBrainPath);
+const { runMorningRoutine } = await import(morningRoutinePath);
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -586,6 +594,39 @@ function scheduleDailyReport(): void {
   scheduleNext();
 }
 
+/**
+ * Schedule APEX morning routine at 00:01 UTC.
+ * Runs budget planning before any business tasks.
+ */
+function scheduleMorningRoutine(): void {
+  const scheduleNext = () => {
+    const now = new Date();
+    const target = new Date(now);
+    target.setUTCHours(0, 1, 0, 0); // 00:01 UTC
+    if (target.getTime() <= now.getTime()) {
+      target.setUTCDate(target.getUTCDate() + 1);
+    }
+    const delay = target.getTime() - now.getTime();
+
+    setTimeout(async () => {
+      try {
+        logger.info('APEX: Running morning routine — budget planning session');
+        await runMorningRoutine();
+        logger.info('APEX: Morning routine completed');
+      } catch (err) {
+        logger.error({ err }, 'APEX: Morning routine failed');
+      }
+      scheduleNext();
+    }, delay);
+
+    logger.info(
+      { nextRun: target.toISOString(), delayMs: delay },
+      'APEX: Morning routine scheduled',
+    );
+  };
+  scheduleNext();
+}
+
 async function main(): Promise<void> {
   // APEX Cost Enforcement: Start cost proxy before anything else
   try {
@@ -791,6 +832,9 @@ async function main(): Promise<void> {
   });
   // APEX: Schedule daily spend report at 23:59 UTC
   scheduleDailyReport();
+
+  // APEX: Schedule morning routine at 00:01 UTC — budget planning before any tasks
+  scheduleMorningRoutine();
 
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

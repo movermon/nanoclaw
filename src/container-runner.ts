@@ -16,7 +16,11 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
-import { checkBudget, isRestrictedMode, sendTelegramAlert } from './spend-tracker.js';
+import {
+  checkBudget,
+  isRestrictedMode,
+  sendTelegramAlert,
+} from './spend-tracker.js';
 import { COST_PROXY_PORT } from './cost-proxy.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -259,7 +263,10 @@ async function buildContainerArgs(
     // The -e flag is at baseUrlIdx - 1
     args.splice(baseUrlIdx - 1, 2);
   }
-  args.push('-e', `ANTHROPIC_BASE_URL=http://host.docker.internal:${COST_PROXY_PORT}`);
+  args.push(
+    '-e',
+    `ANTHROPIC_BASE_URL=http://host.docker.internal:${COST_PROXY_PORT}`,
+  );
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
@@ -302,7 +309,8 @@ export async function runContainerAgent(
     return {
       status: 'error',
       result: null,
-      error: 'APEX_BUDGET_EXCEEDED: Daily spend limit reached. No API calls allowed today.',
+      error:
+        'APEX_BUDGET_EXCEEDED: Daily spend limit reached. No API calls allowed today.',
     };
   }
 

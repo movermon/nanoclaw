@@ -165,7 +165,8 @@ export class WhatsAppChannel implements Channel {
         const reason = (
           lastDisconnect?.error as { output?: { statusCode?: number } }
         )?.output?.statusCode;
-        const shouldReconnect = reason !== DisconnectReason.loggedOut && !this.authFailed;
+        const shouldReconnect =
+          reason !== DisconnectReason.loggedOut && !this.authFailed;
         logger.info(
           {
             reason,
