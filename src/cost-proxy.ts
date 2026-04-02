@@ -25,6 +25,18 @@ const { getPacingAllowance, requiresSonnet } = await import(budgetBrainPath);
 const compressorPath = require.resolve('../prompt-compressor.js');
 const { compressMessages } = await import(compressorPath);
 
+// KB Gate: check knowledge base before API calls
+const kbGatePath = require.resolve('../kb-gate.js');
+const { kbCheck } = await import(kbGatePath);
+
+// Dedup Cache: avoid repeating similar API calls
+const dedupCachePath = require.resolve('../dedup-cache.js');
+const { cacheCheck, cacheStore } = await import(dedupCachePath);
+
+// Research Compressor: compress research results in responses
+const researchCompressorPath = require.resolve('../research-compressor.js');
+const { compressResearch } = await import(researchCompressorPath);
+
 export const COST_PROXY_PORT = 10255;
 
 const ALLOWED_MODELS = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6'];
@@ -143,6 +155,84 @@ export function startCostProxy(): Promise<http.Server> {
           }
         }
 
+        // APEX KB Gate & Dedup Cache: pre-flight checks before API calls
+        if (isMessagesEndpoint && req.method === 'POST') {
+          try {
+            const parsed = JSON.parse(requestBody.toString());
+            // Extract user prompt from the last user message
+            const lastUserMsg = [...(parsed.messages || [])].reverse().find(
+              (m: any) => m.role === 'user',
+            );
+            const promptText =
+              typeof lastUserMsg?.content === 'string'
+                ? lastUserMsg.content
+                : Array.isArray(lastUserMsg?.content)
+                  ? lastUserMsg.content
+                      .filter((b: any) => b.type === 'text')
+                      .map((b: any) => b.text)
+                      .join(' ')
+                  : '';
+
+            if (promptText) {
+              // 1. KB Gate: check local knowledge base first
+              const kbResult = await kbCheck(promptText);
+              if (kbResult.found) {
+                logger.info(
+                  { source: kbResult.source },
+                  'APEX KB HIT: Answered from knowledge base, 0 tokens spent',
+                );
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    id: `kb-hit-${Date.now()}`,
+                    type: 'message',
+                    role: 'assistant',
+                    content: [
+                      {
+                        type: 'text',
+                        text: `[KB: ${kbResult.source}]\n\n${kbResult.content}`,
+                      },
+                    ],
+                    model: DEFAULT_MODEL,
+                    stop_reason: 'end_turn',
+                    usage: { input_tokens: 0, output_tokens: 0 },
+                  }),
+                );
+                return;
+              }
+
+              // 2. Dedup Cache: check for recent similar calls
+              const cacheResult = cacheCheck(promptText, parsed.model);
+              if (cacheResult.hit) {
+                logger.info(
+                  {
+                    fingerprint: cacheResult.fingerprint,
+                    age: cacheResult.age_minutes,
+                  },
+                  'APEX CACHE HIT: 0 tokens spent',
+                );
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    id: `cache-hit-${Date.now()}`,
+                    type: 'message',
+                    role: 'assistant',
+                    content: [
+                      { type: 'text', text: cacheResult.result },
+                    ],
+                    model: parsed.model || DEFAULT_MODEL,
+                    stop_reason: 'end_turn',
+                    usage: { input_tokens: 0, output_tokens: 0 },
+                  }),
+                );
+                return;
+              }
+            }
+          } catch {
+            // Non-parseable body or KB/cache error — proceed to API
+          }
+        }
+
         // Enforce model and token caps on messages requests
         let forwardBody = requestBody.toString();
         let trackedModel = DEFAULT_MODEL;
@@ -239,6 +329,47 @@ export function startCostProxy(): Promise<http.Server> {
                       },
                       'APEX: Recorded API call',
                     );
+
+                    // Store result in dedup cache for future calls
+                    const responseText =
+                      Array.isArray(parsed.content)
+                        ? parsed.content
+                            .filter((b: any) => b.type === 'text')
+                            .map((b: any) => b.text)
+                            .join('\n')
+                        : '';
+                    if (responseText) {
+                      try {
+                        const reqParsed = JSON.parse(requestBody.toString());
+                        const lastMsg = [...(reqParsed.messages || [])]
+                          .reverse()
+                          .find((m: any) => m.role === 'user');
+                        const promptForCache =
+                          typeof lastMsg?.content === 'string'
+                            ? lastMsg.content
+                            : '';
+                        if (promptForCache) {
+                          cacheStore(
+                            promptForCache,
+                            responseText,
+                            parsed.model || trackedModel,
+                          );
+                        }
+                      } catch {
+                        // Skip cache store on error
+                      }
+
+                      // Run research compressor on response if it looks like research
+                      const lowerResp = responseText.toLowerCase();
+                      if (
+                        lowerResp.includes('http') ||
+                        lowerResp.includes('source:') ||
+                        lowerResp.includes('according to') ||
+                        lowerResp.includes('research')
+                      ) {
+                        compressResearch(responseText, '', '').catch(() => {});
+                      }
+                    }
                   }
                 } catch {
                   // Non-JSON response, skip tracking

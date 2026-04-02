@@ -18,6 +18,16 @@ const _require = createRequire(import.meta.url);
 const budgetBrainPath = _require.resolve('../../budget-brain.js');
 const { formatBudgetMessage } = await import(budgetBrainPath);
 
+// APEX Compression Dashboard: /compression command
+const kbGatePath = _require.resolve('../../kb-gate.js');
+const { getKBStats } = await import(kbGatePath);
+const dedupCachePath = _require.resolve('../../dedup-cache.js');
+const { getCacheStats } = await import(dedupCachePath);
+const researchCompressorPath = _require.resolve('../../research-compressor.js');
+const { getCompressionStats } = await import(researchCompressorPath);
+const kbGuardianPath = _require.resolve('../../kb-guardian.js');
+const { getKBHealth } = await import(kbGuardianPath);
+
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -104,9 +114,66 @@ export class TelegramChannel implements Channel {
       }
     });
 
+    // APEX Compression Dashboard command
+    this.bot.command('compression', async (ctx) => {
+      try {
+        const kb = getKBStats();
+        const cache = getCacheStats();
+        const research = getCompressionStats();
+        const health = getKBHealth();
+
+        // Estimate USD saved (assuming ~$0.00025 per 1K input tokens for Haiku)
+        const totalTokensSaved =
+          kb.tokensSaved + research.totalTokensSaved;
+        const usdSaved = (totalTokensSaved / 1000) * 0.00025;
+
+        const lines = [
+          `\u{1f5dc}\u{fe0f} *APEX Compression Report*`,
+          ``,
+          `*KB Gate:*`,
+          `  Hit rate: ${kb.hitRate} (${kb.hits}/${kb.total} checks)`,
+          `  Tokens saved: ${kb.tokensSaved.toLocaleString()}`,
+          ``,
+          `*Dedup Cache:*`,
+          `  Hit rate: ${cache.hitRate} (${cache.todayHits}/${cache.todayChecks} checks)`,
+          `  Active entries: ${cache.totalEntries}`,
+          ``,
+          `*Research Compression:*`,
+          `  Sessions today: ${research.total}`,
+          `  Avg ratio: ${research.avgRatio}`,
+          `  Tokens saved: ${research.totalTokensSaved.toLocaleString()}`,
+          ``,
+          `*KB Health:*`,
+          `  Files: ${health.fileCount} (${health.totalLines} lines)`,
+          `  Oversized: ${health.oversizedCount} files`,
+          ``,
+          `*Estimated savings today:*`,
+          `  Tokens: ${totalTokensSaved.toLocaleString()}`,
+          `  USD: ~$${usdSaved.toFixed(4)}`,
+        ];
+
+        await sendTelegramMessage(
+          this.bot!.api,
+          ctx.chat.id,
+          lines.join('\n'),
+          ctx.message?.message_thread_id
+            ? { message_thread_id: ctx.message.message_thread_id }
+            : {},
+        );
+      } catch (err) {
+        logger.error({ err }, 'Failed to generate compression dashboard');
+        ctx.reply('Failed to generate compression dashboard.');
+      }
+    });
+
     // Telegram bot commands handled above — skip them in the general handler
     // so they don't also get stored as messages. All other /commands flow through.
-    const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping', 'budget']);
+    const TELEGRAM_BOT_COMMANDS = new Set([
+      'chatid',
+      'ping',
+      'budget',
+      'compression',
+    ]);
 
     this.bot.on('message:text', async (ctx) => {
       if (ctx.message.text.startsWith('/')) {

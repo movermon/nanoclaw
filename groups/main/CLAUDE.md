@@ -305,3 +305,33 @@ If a user wants tasks running more than ~2x daily and a script can't reduce agen
 - Suggest restructuring with a script that checks the condition first
 - If the user needs an LLM to evaluate data, suggest using an API key with direct Anthropic API calls inside the script
 - Help the user find the minimum viable frequency
+
+---
+
+## APEX Compression System (CODE ENFORCED)
+
+All compression techniques are enforced in code. No directive below is optional.
+
+### KB Gate — enforced by `kb-gate.js`
+Before any API call, the local knowledge base (`groups/main/knowledge/`) is searched. If relevant content is found (3+ keyword matches), the KB content is returned directly with 0 tokens spent. Wired into `cost-proxy.ts`.
+
+### Context Briefs — enforced by `context-brief.js`
+Subagents receive a compressed context brief (max 500 tokens) instead of full conversation history or full CLAUDE.md. Brief includes: mission, relevant business context, known facts, constraints, prior findings, task, and output format. Wired into `container-runner.ts`.
+
+### Research Compression — enforced by `research-compressor.js`
+Raw research results (web search, web fetch) are compressed before storage: HTML/markdown stripped, URLs reduced to domains, key facts extracted, duplicates removed, max 20 bullet points per session. Compression ratio logged. Wired into `cost-proxy.ts` response pipeline.
+
+### KB Guardian — enforced by `kb-guardian.js`
+Runs every 6 hours (scheduled in `index.ts`):
+- Archives KB files exceeding 150 lines to `knowledge/archive/`
+- Deduplicates facts across KB files
+- Sends weekly Sunday KB health summary via Telegram
+
+### Dedup Cache — enforced by `dedup-cache.js`
+API call results are cached by semantic fingerprint (hash of first 200 prompt chars). TTLs: research 24h, market data 6h, business decisions 72h. Cache hits return stored results with 0 tokens spent. Wired into `cost-proxy.ts`.
+
+### Prompt Compression — enforced by `prompt-compressor.js`
+Prompts are compressed before every API call: whitespace normalized, filler stripped, duplicates removed, aggressive truncation over 2000 tokens. Wired into `cost-proxy.ts`.
+
+### Dashboard
+Send `/compression` in Telegram for live stats: KB hit rate, cache hit rate, research compression ratio, tokens saved, USD saved.

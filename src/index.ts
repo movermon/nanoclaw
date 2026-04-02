@@ -80,6 +80,10 @@ const morningRoutinePath = _require.resolve('../morning-routine.js');
 const { getDailyEnvelope, getPacingAllowance } = await import(budgetBrainPath);
 const { runMorningRoutine } = await import(morningRoutinePath);
 
+// APEX KB Guardian: periodic KB hygiene
+const kbGuardianPath = _require.resolve('../kb-guardian.js');
+const { runGuardian, formatKBHealthMessage } = await import(kbGuardianPath);
+
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
 
@@ -627,6 +631,47 @@ function scheduleMorningRoutine(): void {
   scheduleNext();
 }
 
+/**
+ * Schedule APEX KB Guardian every 6 hours.
+ * Enforces KB file size limits, deduplication, and health reporting.
+ */
+function scheduleKBGuardian(): void {
+  const SIX_HOURS = 6 * 60 * 60 * 1000;
+
+  const run = async () => {
+    try {
+      logger.info('APEX: Running KB Guardian — knowledge base hygiene');
+      const result = await runGuardian();
+      logger.info(
+        {
+          archived: result.archived.length,
+          deduplicated: result.deduplicated.length,
+          filesChecked: result.filesChecked,
+        },
+        'APEX: KB Guardian completed',
+      );
+
+      // Send weekly Sunday summary
+      const now = new Date();
+      if (now.getUTCDay() === 0 && now.getUTCHours() < 6) {
+        const msg = formatKBHealthMessage();
+        sendTelegramAlert(msg).catch(() => {});
+      }
+    } catch (err) {
+      logger.error({ err }, 'APEX: KB Guardian failed');
+    }
+  };
+
+  // Run immediately on startup, then every 6 hours
+  run();
+  setInterval(run, SIX_HOURS);
+
+  logger.info(
+    { intervalMs: SIX_HOURS },
+    'APEX: KB Guardian scheduled every 6 hours',
+  );
+}
+
 async function main(): Promise<void> {
   // APEX Cost Enforcement: Start cost proxy before anything else
   try {
@@ -835,6 +880,9 @@ async function main(): Promise<void> {
 
   // APEX: Schedule morning routine at 00:01 UTC — budget planning before any tasks
   scheduleMorningRoutine();
+
+  // APEX: Schedule KB Guardian every 6 hours — knowledge base hygiene
+  scheduleKBGuardian();
 
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

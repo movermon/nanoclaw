@@ -31,8 +31,16 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { OneCLI } from '@onecli-sh/sdk';
+import { createRequire } from 'module';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+
+// APEX Context Brief: compressed context for subagents
+const _require = createRequire(import.meta.url);
+const contextBriefPath = _require.resolve('../context-brief.js');
+const { buildBrief, getRelevantKBFiles } = await import(contextBriefPath);
+const budgetBrainPath = _require.resolve('../budget-brain.js');
+const { getDailyEnvelope } = await import(budgetBrainPath);
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -320,6 +328,25 @@ export async function runContainerAgent(
       'APEX: Running in restricted mode (spend >= $2.50)',
     );
   }
+
+  // APEX Context Brief Enforcer: generate compressed brief for subagents
+  const envelope = getDailyEnvelope();
+  const briefResult = buildBrief(input.prompt, [], [], {
+    budgetRemaining: envelope.usd_remaining,
+    model: 'claude-haiku-4-5-20251001',
+    maxTokens: 1024,
+  });
+
+  // Log subagent context stats
+  logger.info(
+    {
+      group: group.name,
+      briefTokens: briefResult.tokenCount,
+      kbFilesProvided: briefResult.kbFilePaths.length,
+      estimatedCallCost: `$${envelope.usd_remaining} remaining`,
+    },
+    'APEX: Subagent context brief generated',
+  );
 
   const startTime = Date.now();
 
